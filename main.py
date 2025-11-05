@@ -3,7 +3,7 @@ import json
 import gspread
 from google.oauth2.service_account import Credentials
 from playwright.sync_api import sync_playwright
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import streamlit as st
 
@@ -59,14 +59,12 @@ def authorize_gsheets():
         st.error(f"Google Sheets authorization failed: {e}")
         st.stop()
 
-
 # === READ URLS ===
 def read_urls_from_sheet(client):
     """Read URLs from the Input sheet"""
     sheet = client.open_by_key(SPREADSHEET_ID).worksheet(INPUT_SHEET_NAME)
     urls = sheet.col_values(1)[1:]  # Skip header row
     return [url.strip() for url in urls if url.strip()]
-
 
 # === WRITE RESULTS ===
 def write_results_to_sheet(client, results):
@@ -82,13 +80,12 @@ def write_results_to_sheet(client, results):
     sheet.clear()
     sheet.update("A1", rows, value_input_option="RAW")
 
-
 # === TRACKER CHECKER ===
 def check_url(url):
     """Check a single URL for tracker activity"""
     tracker_status = {tracker: False for tracker in TRACKERS}
     error_msg = ""
-    checked_at = get_ist_time()  # ✅ IST time
+    checked_at = get_ist_time()
 
     try:
         with sync_playwright() as p:
@@ -102,7 +99,6 @@ def check_url(url):
             )
             page = context.new_page()
 
-            # Listen to all network requests
             def handle_request(request):
                 req_url = request.url.lower()
                 for tracker in TRACKERS:
@@ -111,10 +107,9 @@ def check_url(url):
 
             page.on("request", handle_request)
 
-            # Load page and wait
             page.goto(url, timeout=180000, wait_until="networkidle")
             page.mouse.wheel(0, 1000)
-            page.wait_for_timeout(5000)  # Wait 5s for background requests
+            page.wait_for_timeout(5000)
 
             context.close()
             browser.close()
@@ -125,11 +120,8 @@ def check_url(url):
     result = {"url": url, "error": error_msg, "checked_at": checked_at}
     result.update(tracker_status)
 
-    # ✅ Print IST timestamp in logs too
-    print(f"[{checked_at}] Checked: {url} -> {tracker_status}")
-
+    print(f"[{checked_at}] ✅ Checked: {url}")
     return result
-
 
 # === STREAMLIT UI ===
 def main():
@@ -140,7 +132,6 @@ def main():
 
     if st.button("🚀 Run Tracker"):
         st.info("Running tracker... please wait.")
-
         try:
             client = authorize_gsheets()
             urls = read_urls_from_sheet(client)
@@ -152,12 +143,26 @@ def main():
             st.warning("No URLs found in the Input sheet.")
             return
 
-        st.write(f"Found **{len(urls)} URLs** to check...")
+        total = len(urls)
+        st.write(f"Found **{total} URLs** to check...")
+        progress = st.progress(0)
+        status_placeholder = st.empty()
+        results_table = st.empty()
 
         results = []
+        completed = 0
+
         with ThreadPoolExecutor(max_workers=3) as executor:
-            for res in executor.map(check_url, urls):
+            futures = {executor.submit(check_url, url): url for url in urls}
+            for future in as_completed(futures):
+                res = future.result()
                 results.append(res)
+                completed += 1
+
+                # Update Streamlit display dynamically
+                status_placeholder.write(f"✅ **{completed}/{total} completed** — {res['url']}")
+                progress.progress(completed / total)
+                results_table.dataframe(results)
 
         try:
             write_results_to_sheet(client, results)
@@ -165,7 +170,6 @@ def main():
             st.write(f"🕒 Completed at (IST): **{get_ist_time()}**")
         except Exception as e:
             st.error(f"Error writing results: {e}")
-
 
 if __name__ == "__main__":
     main()
